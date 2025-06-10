@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Stack for ETL resources - S3 Data Bucket, Lambda, Role
+Parameters:
+  TeamName:
+    Type: String
+    Description: Enter your name in format 'first-last' to customise the way your
+      resources are named
+    Default: rise-and-grind
+  DBName:
+    Type: String
+    Description: Enter the team name you want to use for DB connections
+    Default: riseandgrindgrind_cafe_db
+  NetworkStackName:
+    Type: String
+    Description: Network stack with VPC
+    Default: project-networking
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Automatically look up the latest AMI for Amazon Linux v2
+  EC2InstanceProfileRoleName:
+    Type: String
+    Default: de-academy-ec2-role-instance-profile
+    Description: The shared EC2 instance profile name to use
+  EC2InstanceIngressIp:
+    Type: String
+    Description: Custom IP address for Grafana HTTP ingress rule
+    Default: 0.0.0.0
+  EC2UserData:
+    Type: String
+    Default: ''
+    Description: User data script to run on EC2 server boot
+Resources:
+  EtlLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: ${TeamName}-etl-lambda
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role:
+        Fn::Sub: arn:aws:iam::${AWS::AccountId}:role/lambda-execution-role
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      Code:
+        S3Bucket: rise-and-grind-deployment-bucket
+        S3Key: a85c98fb3e72adf3b27cc43f094afec4
+      VpcConfig:
+        SecurityGroupIds:
+        - Fn::ImportValue: project-networking-VPCSGID
+        SubnetIds:
+        - Fn::ImportValue: project-networking-PrivateSubnet0ID
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${TeamName}-etl-lambda
+      Environment:
+        Variables:
+          SSM_PARAMETER_NAME:
+            Fn::Join:
+            - _
+            - Fn::Split:
+              - '-'
+              - Fn::Sub: riseandgrindgrind_redshift_settings
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+    - RawDataBucketPermission
+    - EtlLambdaFunction
+    Properties:
+      BucketName:
+        Fn::Sub: ${TeamName}-raw-data
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Event: s3:ObjectCreated:*
+          Function:
+            Fn::GetAtt:
+            - EtlLambdaFunction
+            - Arn
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${TeamName}raw-data
+  RawDataBucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Ref: EtlLambdaFunction
+      Principal: s3.amazonaws.com
+      SourceArn:
+        Fn::Sub: arn:aws:s3:::${TeamName}-raw-data
+  RawDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: RawDataBucket
+      PolicyDocument:
+        Statement:
+        - Sid: AllowSSLRequestsOnly
+          Action: s3:*
+          Principal: '*'
+          Effect: Deny
+          Resource:
+          - Fn::Sub: arn:aws:s3:::${TeamName}-raw-data
+          - Fn::Sub: arn:aws:s3:::${TeamName}-raw-data/*
+          Condition:
+            Bool:
+              aws:SecureTransport: 'false'
+  GrafanaEc2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId:
+        Ref: LatestAmiId
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${TeamName}-ec2-grafana
+      NetworkInterfaces:
+      - AssociatePublicIpAddress: true
+        DeviceIndex: '0'
+        SubnetId:
+          Fn::ImportValue: project-networking-PublicSubnet0ID
+        GroupSet:
+        - Fn::ImportValue: project-networking-VPCSGID
+        - Fn::GetAtt: GrafanaEC2InstanceSecurityGroup.GroupId
+      LaunchTemplate:
+        LaunchTemplateId:
+          Ref: GrafanaEC2LaunchTemplate
+        Version:
+          Fn::GetAtt:
+          - GrafanaEC2LaunchTemplate
+          - LatestVersionNumber
+  GrafanaEC2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName:
+        Fn::Sub: ${TeamName}-ec2-grafana-launch-template
+      VersionDescription: '01'
+      LaunchTemplateData:
+        UserData:
+          Ref: EC2UserData
+        IamInstanceProfile:
+          Name:
+            Ref: EC2InstanceProfileRoleName
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpProtocolIpv6: disabled
+          HttpPutResponseHopLimit: 10
+          HttpTokens: optional
+          InstanceMetadataTags: enabled
+        Monitoring:
+          Enabled: true
+        BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 8
+            Encrypted: true
+            DeleteOnTermination: true
+  GrafanaEC2InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Sets ingress and egress rules for HTTP, HTTPS and SSH
+      Tags:
+      - Key: Name
+        Value:
+          Fn::Sub: ${TeamName}-ec2-grafana
+      VpcId:
+        Fn::ImportValue: project-networking-VPCID
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp:
+          Fn::Sub: ${EC2InstanceIngressIp}/32
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 86.16.172.45/32
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 104.28.86.104/32
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 86.169.236.4/32
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 109.146.106.51/32
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp:
+          Fn::Sub: ${EC2InstanceIngressIp}/32
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
